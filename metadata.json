@@ -1,0 +1,7 @@
+{
+  "name": "SpeakEasy Friend",
+  "description": "A patient, friendly English practice partner designed for beginners. Practice daily conversations with real-time feedback.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
