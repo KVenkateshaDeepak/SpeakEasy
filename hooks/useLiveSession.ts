@@ -44,8 +44,49 @@ export const useLiveSession = () => {
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
+  // Shared cleanup function
+  const cleanup = useCallback(() => {
+    console.log('Cleaning up session resources');
+
+    // Stop all media tracks
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+
+    // Disconnect and close audio context stuff
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (inputSourceRef.current) {
+      inputSourceRef.current.disconnect();
+      inputSourceRef.current = null;
+    }
+    if (inputAudioContextRef.current) {
+      inputAudioContextRef.current.close();
+      inputAudioContextRef.current = null;
+    }
+    if (outputAudioContextRef.current) {
+      outputAudioContextRef.current.close();
+      outputAudioContextRef.current = null;
+    }
+
+    // Stop active audio sources
+    activeSourcesRef.current.forEach(src => {
+      try { src.stop(); } catch (e) { }
+    });
+    activeSourcesRef.current.clear();
+
+    sessionPromiseRef.current = null;
+    setVolume(0);
+  }, []);
+
   const connect = useCallback(async () => {
     try {
+      // Ensure clean state before connecting
+      cleanup();
+
       setConnectionState(ConnectionState.CONNECTING);
 
       // Initialize Audio Contexts
@@ -74,14 +115,13 @@ export const useLiveSession = () => {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
           },
-          // Removed transcription config to prevent Network Errors and invalid argument issues
         },
         callbacks: {
           onopen: () => {
             console.log('Session connected');
             setConnectionState(ConnectionState.CONNECTED);
 
-            // Add initial greeting message locally since we removed transcription
+            // Add initial greeting message locally
             setMessages([{
               id: 'init',
               role: 'assistant',
@@ -99,6 +139,9 @@ export const useLiveSession = () => {
             processorRef.current = processor;
 
             processor.onaudioprocess = (e) => {
+              // CRITICAL: Check if we are still connected before processing
+              if (!sessionPromiseRef.current) return;
+
               const inputData = e.inputBuffer.getChannelData(0);
 
               // Calculate volume for visualizer
@@ -108,8 +151,17 @@ export const useLiveSession = () => {
               setVolume(Math.min(rms * 5, 1));
 
               const pcmBlob = createBlob(inputData);
+
+              // Send data only if session is valid
               sessionPromiseRef.current?.then((session) => {
-                session.sendRealtimeInput({ media: pcmBlob });
+                try {
+                  session.sendRealtimeInput({ media: pcmBlob });
+                } catch (e) {
+                  console.warn("Failed to send audio input (session might be closed):", e);
+                }
+              }).catch(err => {
+                // This catch handles rejection if sessionPromiseRef was nullified or rejected
+                console.warn("Session promise issue during input:", err);
               });
             };
 
@@ -117,32 +169,33 @@ export const useLiveSession = () => {
             processor.connect(inputAudioContextRef.current.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Note: Text transcription is disabled to ensure connection stability.
-            // We rely on audio interaction.
-
             // Handle Audio Output
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio && outputAudioContextRef.current && outputNodeRef.current) {
               const ctx = outputAudioContextRef.current;
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
 
-              const audioBuffer = await decodeAudioData(
-                decode(base64Audio),
-                ctx,
-                AUDIO_SAMPLE_RATE_OUTPUT,
-                1
-              );
+              try {
+                const audioBuffer = await decodeAudioData(
+                  decode(base64Audio),
+                  ctx,
+                  AUDIO_SAMPLE_RATE_OUTPUT,
+                  1
+                );
 
-              const source = ctx.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(outputNodeRef.current);
-              source.addEventListener('ended', () => {
-                activeSourcesRef.current.delete(source);
-              });
+                const source = ctx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(outputNodeRef.current);
+                source.addEventListener('ended', () => {
+                  activeSourcesRef.current.delete(source);
+                });
 
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += audioBuffer.duration;
-              activeSourcesRef.current.add(source);
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += audioBuffer.duration;
+                activeSourcesRef.current.add(source);
+              } catch (e) {
+                console.error("Audio decoding error:", e);
+              }
             }
 
             // Handle Interruptions
@@ -157,10 +210,12 @@ export const useLiveSession = () => {
           onclose: () => {
             console.log('Session closed');
             setConnectionState(ConnectionState.DISCONNECTED);
+            cleanup();
           },
           onerror: (err) => {
             console.error('Session error', err);
             setConnectionState(ConnectionState.ERROR);
+            cleanup();
           }
         }
       });
@@ -169,13 +224,15 @@ export const useLiveSession = () => {
       sessionPromiseRef.current.catch((err) => {
         console.error("Connection promise rejected:", err);
         setConnectionState(ConnectionState.ERROR);
+        cleanup();
       });
 
     } catch (error) {
       console.error("Failed to connect", error);
       setConnectionState(ConnectionState.ERROR);
+      cleanup();
     }
-  }, []);
+  }, [cleanup]);
 
   const disconnect = useCallback(async () => {
     if (sessionPromiseRef.current) {
@@ -188,22 +245,10 @@ export const useLiveSession = () => {
       }
     }
 
-    // Cleanup Audio
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    processorRef.current?.disconnect();
-    inputSourceRef.current?.disconnect();
-    inputAudioContextRef.current?.close();
-    outputAudioContextRef.current?.close();
-
-    activeSourcesRef.current.forEach(src => {
-      try { src.stop(); } catch (e) { }
-    });
-    activeSourcesRef.current.clear();
-
+    // Run cleanup
+    cleanup();
     setConnectionState(ConnectionState.DISCONNECTED);
-    setVolume(0);
-    sessionPromiseRef.current = null;
-  }, []);
+  }, [cleanup]);
 
   return {
     connectionState,
